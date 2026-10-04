@@ -11,8 +11,16 @@ from app.models import (
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
+    SettlementRequest,
+    SettlementResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
+)
+from app.settlement import (
+    NoValidIntervalError,
+    PlanMismatchError,
+    find_plan_mismatches,
+    settle_execution,
 )
 from app.solver import InfeasibleError, solve_dispatch
 
@@ -22,9 +30,11 @@ app = FastAPI(
         "输入半小时电价/基础负荷/光伏预测与电池参数，"
         "按 0.1kWh 离散 SOC 做动态规划，求满足功率、SOC 与末端约束的最低总成本计划；"
         "另提供 /telemetry/audit 对半小时实测记录做电芯能量守恒与购电量核对"
-        "（只审计标记异常，不修正读数、不生成调度计划）。"
+        "（只审计标记异常，不修正读数、不生成调度计划）；"
+        "/dispatch/settlement 对计划执行做结算：重算核验计划快照、复用遥测审计"
+        "划定连续有效区间，按实测购电与吞吐量核算实际费用并与计划对比。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -48,6 +58,22 @@ async def infeasible_exception_handler(request: Request, exc: InfeasibleError):
     return JSONResponse(
         status_code=422,
         content={"error": "infeasible", "reason": str(exc)},
+    )
+
+
+@app.exception_handler(PlanMismatchError)
+async def plan_mismatch_exception_handler(request: Request, exc: PlanMismatchError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": "plan_mismatch", "reason": str(exc)},
+    )
+
+
+@app.exception_handler(NoValidIntervalError)
+async def no_valid_interval_exception_handler(request: Request, exc: NoValidIntervalError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": "no_valid_interval", "reason": str(exc)},
     )
 
 
@@ -102,3 +128,59 @@ async def telemetry_audit(req: TelemetryAuditRequest) -> TelemetryAuditResponse:
         records=req.records,
     )
     return TelemetryAuditResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/settlement",
+    response_model=SettlementResponse,
+    responses={
+        422: {
+            "model": ErrorResponse,
+            "description": "非法输入、计划快照不一致、无可结算区间或调度问题无解",
+        }
+    },
+    tags=["settlement"],
+)
+async def dispatch_settlement(req: SettlementRequest) -> SettlementResponse:
+    """计划执行结算：重算核验快照，复用遥测审计划定有效区间，按实测核算费用。"""
+    # 1. 用同一输入重算最优计划，确认快照未被篡改
+    recomputed = solve_dispatch(
+        prices=req.dispatch.prices,
+        base_load_kw=req.dispatch.base_load_kw,
+        pv_kw=req.dispatch.pv_kw,
+        capacity_kwh=req.dispatch.capacity_kwh,
+        max_charge_kw=req.dispatch.max_charge_kw,
+        max_discharge_kw=req.dispatch.max_discharge_kw,
+        charge_efficiency=req.dispatch.charge_efficiency,
+        discharge_efficiency=req.dispatch.discharge_efficiency,
+        initial_soc_kwh=req.dispatch.initial_soc_kwh,
+        min_terminal_soc_kwh=req.dispatch.min_terminal_soc_kwh,
+        degradation_cost=req.dispatch.degradation_cost_per_kwh,
+    )
+    mismatches = find_plan_mismatches(recomputed, req.plan)
+    if mismatches:
+        shown = "；".join(mismatches[:3])
+        suffix = f" 等共 {len(mismatches)} 处" if len(mismatches) > 3 else ""
+        raise PlanMismatchError(
+            f"计划快照与按所给输入重算的最优计划不一致（疑似被篡改或与输入不配套）：{shown}{suffix}"
+        )
+
+    # 2. 复用遥测审计逐条核对实测记录（结算容差即审计能量容差）
+    audit_report = audit_telemetry(
+        charge_efficiency=req.dispatch.charge_efficiency,
+        discharge_efficiency=req.dispatch.discharge_efficiency,
+        energy_tolerance_kwh=req.settlement_tolerance_kwh,
+        records=req.records,
+    )
+
+    # 3. 对首条异常前的连续有效区间做结算核算
+    result = settle_execution(
+        prices=req.dispatch.prices,
+        degradation_cost_per_kwh=req.dispatch.degradation_cost_per_kwh,
+        charge_efficiency=req.dispatch.charge_efficiency,
+        discharge_efficiency=req.dispatch.discharge_efficiency,
+        recomputed_plan=recomputed,
+        records=req.records,
+        audit_report=audit_report,
+    )
+    return SettlementResponse.model_validate(result)

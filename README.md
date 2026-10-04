@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划），以及 `/dispatch/settlement` 对计划执行做**结算**：重算核验计划快照、复用遥测审计划定连续有效区间，按实测购电与吞吐量核算实际费用并与计划对比。
 
 ## 一条命令启动
 
@@ -191,6 +191,107 @@ curl -s -X POST http://localhost:8000/telemetry/audit \
 }
 ```
 
+### `POST /dispatch/settlement`
+
+对一次计划执行做**结算**。请求携带一次 `/dispatch` 的完整输入、该次调用的完整响应快照、结算容差，以及与调度时段**等长**的实测记录。处理流程：
+
+1. **快照核验**：用所给输入重新求解，与 `plan` 快照逐字段比对（数值容差 1e-9，仅吸收 JSON 表示差异）；任何篡改或与其他输入混用都会暴露，整体拒绝；
+2. **记录审计**：复用 `/telemetry/audit` 的同一套核算（电芯能量守恒、购电量功率平衡、相邻 SOC 衔接），容差取 `settlement_tolerance_kwh`；
+3. **有效区间**：自首条异常记录（含 SOC 断点）起，该条及后续所有记录只能标为**待结算**；之前的连续有效区间才参与结算；
+4. **费用核算**：对有效区间按实测值计算实际费用，与计划费用对比。
+
+实际费用口径（与 `/dispatch` 费用模型一致）：
+
+```
+实际能量费 = 时段电价 × 实测购电量
+实际衰减费 = degradation_cost_per_kwh × 实测电芯吞吐量
+实测电芯吞吐量 = 交流充电量×充电效率 + 交流放电量÷放电效率   （充、放各计一次）
+```
+
+请求体：
+
+| 字段 | 说明 |
+|---|---|
+| `dispatch` | 一次 `/dispatch` 的完整请求输入（结构同 `/dispatch` 请求体） |
+| `plan` | 该次 `/dispatch` 的完整响应快照（`periods` + `summary`），用于防篡改核验 |
+| `settlement_tolerance_kwh` | 结算容差（kWh，非负），用作实测记录审计的能量容差 |
+| `records` | 按时间顺序排列的实测记录（字段同 `/telemetry/audit`），条数必须与调度时段数一致 |
+
+响应（HTTP 200）：`status` 为 `settled`（全部记录完成结算）或 `partially_settled`（仅首条异常前的连续有效区间完成结算）；`first_anomaly_index` 给出首条异常下标（无异常为 `null`）；顶层汇总只覆盖有效区间；`periods` 逐时段给出 `settled`/`pending` 状态，已结算时段含计划费用、实际费用与各项偏差，待结算时段费用字段为 `null`。
+
+**整体拒绝**（HTTP 422）：计划快照与重算结果不一致（`plan_mismatch`）、实测记录数与调度时段数不符（`invalid_input`）、首条记录即异常导致没有有效区间（`no_valid_interval`）。
+
+示例（4 个时段：t0 实测购电 0.12 与计划 0.1 的残差 0.02 未超容差，正常结算；t2 实测购电 0.3 与核算 0.0 的残差 0.3 超容差 → t2 起待结算）：
+
+```bash
+# plan 字段即先前 POST /dispatch 的完整响应，原样回填
+curl -s -X POST http://localhost:8000/dispatch/settlement \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "dispatch": {
+      "prices": [1.0, 0.0, 1.0, 0.0],
+      "base_load_kw": [0.2, 0.2, 0.2, 0.2],
+      "pv_kw": [0.0, 0.0, 0.0, 0.0],
+      "capacity_kwh": 0.2,
+      "max_charge_kw": 1.0,
+      "max_discharge_kw": 1.0,
+      "charge_efficiency": 1.0,
+      "discharge_efficiency": 1.0,
+      "initial_soc_kwh": 0.0,
+      "min_terminal_soc_kwh": 0.0,
+      "degradation_cost_per_kwh": 0.0
+    },
+    "plan": {
+      "periods": [
+        {"index": 0, "action": "idle", "action_energy_kwh": 0.0, "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.0, "battery_power_kw": 0.0, "grid_purchase_energy_kwh": 0.1, "pv_curtailed_energy_kwh": 0.0, "soc_start_kwh": 0.0, "soc_end_kwh": 0.0, "energy_cost_yuan": 0.1, "degradation_cost_yuan": 0.0},
+        {"index": 1, "action": "charge", "action_energy_kwh": 0.1, "charge_ac_energy_kwh": 0.1, "discharge_ac_energy_kwh": 0.0, "battery_power_kw": 0.2, "grid_purchase_energy_kwh": 0.2, "pv_curtailed_energy_kwh": 0.0, "soc_start_kwh": 0.0, "soc_end_kwh": 0.1, "energy_cost_yuan": 0.0, "degradation_cost_yuan": 0.0},
+        {"index": 2, "action": "discharge", "action_energy_kwh": -0.1, "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.1, "battery_power_kw": -0.2, "grid_purchase_energy_kwh": 0.0, "pv_curtailed_energy_kwh": 0.0, "soc_start_kwh": 0.1, "soc_end_kwh": 0.0, "energy_cost_yuan": 0.0, "degradation_cost_yuan": 0.0},
+        {"index": 3, "action": "idle", "action_energy_kwh": 0.0, "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.0, "battery_power_kw": 0.0, "grid_purchase_energy_kwh": 0.1, "pv_curtailed_energy_kwh": 0.0, "soc_start_kwh": 0.0, "soc_end_kwh": 0.0, "energy_cost_yuan": 0.0, "degradation_cost_yuan": 0.0}
+      ],
+      "summary": {"num_periods": 4, "period_hours": 0.5, "soc_resolution_kwh": 0.1, "total_energy_cost_yuan": 0.1, "total_degradation_cost_yuan": 0.0, "total_cost_yuan": 0.1, "total_grid_purchase_kwh": 0.4, "peak_grid_purchase_energy_kwh": 0.2, "peak_grid_purchase_power_kw": 0.4, "battery_throughput_kwh": 0.2, "terminal_soc_kwh": 0.0}
+    },
+    "settlement_tolerance_kwh": 0.05,
+    "records": [
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.0, "grid_purchase_energy_kwh": 0.12, "soc_start_kwh": 0.0, "soc_end_kwh": 0.0},
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.1, "discharge_ac_energy_kwh": 0.0, "grid_purchase_energy_kwh": 0.2, "soc_start_kwh": 0.0, "soc_end_kwh": 0.1},
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.1, "grid_purchase_energy_kwh": 0.3, "soc_start_kwh": 0.1, "soc_end_kwh": 0.0},
+      {"base_load_kw": 0.2, "pv_kw": 0.0, "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.0, "grid_purchase_energy_kwh": 0.1, "soc_start_kwh": 0.0, "soc_end_kwh": 0.0}
+    ]
+  }'
+```
+
+```json
+{
+  "status": "partially_settled",
+  "num_records": 4,
+  "num_settled_records": 2,
+  "num_pending_records": 2,
+  "period_hours": 0.5,
+  "settlement_tolerance_kwh": 0.05,
+  "first_anomaly_index": 2,
+  "first_anomaly_reasons": ["购电量残差 +0.300000kWh 超容差 0.05kWh（实测 0.3kWh，核算值 0.0kWh）"],
+  "anomalous_records": [2],
+  "pending_record_indices": [2, 3],
+  "planned_cost_yuan": 0.1,
+  "actual_cost_yuan": 0.12,
+  "cost_difference_yuan": 0.02,
+  "planned_energy_cost_yuan": 0.1,
+  "planned_degradation_cost_yuan": 0.0,
+  "actual_energy_cost_yuan": 0.12,
+  "actual_degradation_cost_yuan": 0.0,
+  "planned_grid_purchase_kwh": 0.3,
+  "actual_grid_purchase_kwh": 0.32,
+  "planned_throughput_kwh": 0.1,
+  "actual_throughput_kwh": 0.1,
+  "periods": [
+    {"index": 0, "status": "settled", "planned_cost_yuan": 0.1, "actual_cost_yuan": 0.12, "cost_deviation_yuan": 0.02, "planned_grid_purchase_energy_kwh": 0.1, "measured_grid_purchase_energy_kwh": 0.12, "grid_deviation_kwh": 0.02, "planned_throughput_kwh": 0.0, "measured_throughput_kwh": 0.0, "throughput_deviation_kwh": 0.0},
+    {"index": 1, "status": "settled", "planned_cost_yuan": 0.0, "actual_cost_yuan": 0.0, "cost_deviation_yuan": 0.0, "planned_grid_purchase_energy_kwh": 0.2, "measured_grid_purchase_energy_kwh": 0.2, "grid_deviation_kwh": 0.0, "planned_throughput_kwh": 0.1, "measured_throughput_kwh": 0.1, "throughput_deviation_kwh": 0.0},
+    {"index": 2, "status": "pending", "planned_cost_yuan": null, "actual_cost_yuan": null, "cost_deviation_yuan": null, "planned_grid_purchase_energy_kwh": null, "measured_grid_purchase_energy_kwh": null, "grid_deviation_kwh": null, "planned_throughput_kwh": null, "measured_throughput_kwh": null, "throughput_deviation_kwh": null},
+    {"index": 3, "status": "pending", "planned_cost_yuan": null, "actual_cost_yuan": null, "cost_deviation_yuan": null, "planned_grid_purchase_energy_kwh": null, "measured_grid_purchase_energy_kwh": null, "grid_deviation_kwh": null, "planned_throughput_kwh": null, "measured_throughput_kwh": null, "throughput_deviation_kwh": null}
+  ]
+}
+```
+
 ## 模型与假设
 
 - **时段**：固定 0.5 h；功率（kW）× 0.5 即该时段能量（kWh）。
@@ -235,6 +336,18 @@ curl -s -X POST http://localhost:8000/telemetry/audit \
 
 `invalid_input` 覆盖：数组不等长、负值/非有限值、效率不在 (0,1]、容量/SOC 非 0.1 整数倍、初始或末端 SOC 超过容量、数组长度超出 1–200 等；`infeasible` 表示输入合法但约束可行域为空，并给出最高可达末端 SOC 等诊断信息。`/telemetry/audit` 的非法输入（容量非正、效率越界、测量值或容差为负/非有限、SOC 超容量、记录数超出 1–2000 等）同样以 `invalid_input` 返回。
 
+`/dispatch/settlement` 的整体拒绝（均为 422）：
+
+```json
+{"error": "plan_mismatch", "reason": "计划快照与按所给输入重算的最优计划不一致（疑似被篡改或与输入不配套）：periods[2].grid_purchase_energy_kwh 快照值 0.5 与重算值 0.0 不符"}
+```
+
+```json
+{"error": "no_valid_interval", "reason": "首条实测记录即未通过审计（购电量残差 +0.400000kWh 超容差 0.05kWh（实测 0.5kWh，核算值 0.1kWh）），不存在可结算的连续有效区间，本次结算整体拒绝"}
+```
+
+其中 `plan_mismatch` 表示快照被篡改或与所给输入不配套；`no_valid_interval` 表示首条记录即异常、没有可结算的连续有效区间；实测记录数与调度时段数不符、记录或容差非法等归入 `invalid_input`；`dispatch` 输入本身无解则沿用 `infeasible`。
+
 ## 测试
 
 ```bash
@@ -242,4 +355,4 @@ pip install pytest httpx
 pytest tests/ -q
 ```
 
-覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。
+覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截；计划结算部分覆盖完全一致全额结算、实测偏差与费用差额、异常截断（首条异常起待结算）、SOC 断点截断、快照篡改与跨输入混用拒绝、记录数不符拒绝、首条即异常拒绝、效率与衰减费口径，以及既有接口回归。

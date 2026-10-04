@@ -11,9 +11,12 @@ from app.models import (
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
+    SettlementRequest,
+    SettlementResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
 )
+from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
 
 app = FastAPI(
@@ -22,9 +25,11 @@ app = FastAPI(
         "输入半小时电价/基础负荷/光伏预测与电池参数，"
         "按 0.1kWh 离散 SOC 做动态规划，求满足功率、SOC 与末端约束的最低总成本计划；"
         "另提供 /telemetry/audit 对半小时实测记录做电芯能量守恒与购电量核对"
-        "（只审计标记异常，不修正读数、不生成调度计划）。"
+        "（只审计标记异常，不修正读数、不生成调度计划）；"
+        "/dispatch/settlement 对已下发计划做执行结算：重算校验计划快照、"
+        "复用遥测审计并核对 SOC 轨迹，仅对首个异常/断点之前的连续有效区间计费。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -48,6 +53,14 @@ async def infeasible_exception_handler(request: Request, exc: InfeasibleError):
     return JSONResponse(
         status_code=422,
         content={"error": "infeasible", "reason": str(exc)},
+    )
+
+
+@app.exception_handler(SettlementError)
+async def settlement_error_handler(request: Request, exc: SettlementError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "reason": str(exc)},
     )
 
 
@@ -102,3 +115,25 @@ async def telemetry_audit(req: TelemetryAuditRequest) -> TelemetryAuditResponse:
         records=req.records,
     )
     return TelemetryAuditResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/settlement",
+    response_model=SettlementResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入或结算整体拒绝"}},
+    tags=["settlement"],
+)
+async def dispatch_settlement(req: SettlementRequest) -> SettlementResponse:
+    """计划执行结算：重算校验快照 → 遥测审计 → SOC 轨迹核对 → 有效前缀计费。
+
+    - 计划快照与重算不一致（plan_snapshot_mismatch）、记录长度不符
+      （settlement_length_mismatch）、无有效区间（no_valid_interval）均整体拒绝；
+    - 存在异常/SOC 断点时不报错，返回 status=partially_settled 与首个异常下标。
+    """
+    result = execute_settlement(
+        dispatch_input=req.dispatch.model_dump(),
+        plan_snapshot=req.plan_snapshot.model_dump(),
+        settlement_tolerance_kwh=req.settlement_tolerance_kwh,
+        records=req.records,
+    )
+    return SettlementResponse.model_validate(result)
